@@ -12,26 +12,28 @@
 #define NS_READ_TIMEOUT_MS 1000 // read timeout in milliseconds
 
 typedef struct {
-  unsigned long total, tcp, udp, icmp, icmpv6, other;
+  unsigned long captured;
+  unsigned long decoded;
+  unsigned long decode_failed;
+
+  unsigned long tcp, udp, icmp, icmpv6, other;
   unsigned long port_53, port_80, port_443, port_other;
-  unsigned long bytes;
-  unsigned long capbytes;
 } ns_stats;
 
 /**
  * @brief Update rolling statistics counters from a decoded packet.
  *
- * Increments protocol counters and (for TCP/UDP) destination-port buckets.
+ * Increments decoded counters and (for TCP/UDP) destination-port buckets.
  * Assumes @p info represents a successfully decoded packet.
  *
  * @param[in,out] s     Statistics accumulator.
  * @param[in]     info  Decoded packet metadata.
  */
-static void ns_stats_update(ns_stats *s, const packet_info *info) {
+static void ns_stats_update_decoded(ns_stats *s, const packet_info *info) {
   if (!s || !info)
     return;
 
-  s->total++;
+  s->decoded++;
 
   switch (info->proto) {
   case NS_IPPROTO_TCP:
@@ -73,40 +75,53 @@ static void ns_stats_update(ns_stats *s, const packet_info *info) {
  * @brief Print the current statistics snapshot and reset counters.
  *
  * Intended to be called periodically. Uses @p interval_sec to compute a
- * packets-per-second rate and then clears all counters in @p s.
+ * packets-per-second rate (based on captured packets) and then clears all
+ * counters in @p s.
  *
  * @param[in,out] s             Statistics accumulator.
  * @param[in]     interval_sec  Reporting interval in seconds (must be > 0).
  */
-static void ns_stats_print_reset(ns_stats *s, int interval_sec) {
+static void ns_stats_print_reset(ns_stats *s, int interval_sec, int is_live) {
   if (!s || interval_sec <= 0)
     return;
 
-  unsigned long pps = s->total / (unsigned long)interval_sec;
+  if (is_live) {
+    unsigned long pps = s->captured / (unsigned long)interval_sec;
 
-  printf("rate=%lu packets/s total=%lu tcp=%lu udp=%lu icmp=%lu icmpv6=%lu "
-         "other=%lu | dst 53=%lu 80=%lu 443=%lu other=%lu\n",
-         pps, s->total, s->tcp, s->udp, s->icmp, s->icmpv6, s->other,
-         s->port_53, s->port_80, s->port_443, s->port_other);
+    printf("rate=%lu pkts/s captured=%lu decoded=%lu failed=%lu "
+           "tcp=%lu udp=%lu icmp=%lu icmpv6=%lu other=%lu | "
+           "dst 53=%lu 80=%lu 443=%lu other=%lu\n",
+           pps, s->captured, s->decoded, s->decode_failed, s->tcp, s->udp,
+           s->icmp, s->icmpv6, s->other, s->port_53, s->port_80, s->port_443,
+           s->port_other);
+  } else {
+    printf("captured=%lu decoded=%lu failed=%lu "
+           "tcp=%lu udp=%lu icmp=%lu icmpv6=%lu other=%lu | "
+           "dst 53=%lu 80=%lu 443=%lu other=%lu\n",
+           s->captured, s->decoded, s->decode_failed, s->tcp, s->udp, s->icmp,
+           s->icmpv6, s->other, s->port_53, s->port_80, s->port_443,
+           s->port_other);
+  }
 
   memset(s, 0, sizeof *s);
 }
 
 /**
- * @brief Capture packets on an interface and report decoded output.
+ * @brief Capture packets on an interface or from a pcap file and report output.
  *
- * Opens a live libpcap capture on cfg->iface and processes packets in a loop.
- * Successfully decoded packets update statistics and are either printed
- * individually or aggregated into periodic stats output.
+ * Opens a libpcap capture (live or offline) and processes packets in a loop.
+ * Per-packet output prints only successfully decoded packets. In stats mode,
+ * captured/decoded/failed counters are tracked and printed periodically.
  *
  * The loop terminates when the requested packet count is reached (cfg->count >=
  * 0), libpcap signals EOF, or a libpcap error occurs.
  *
  * When cfg->stats is enabled, statistics are printed and reset every
- * max(cfg->interval_sec, 1) seconds.
+ * max(cfg->interval_sec, 1) seconds. Stats are only printed if at least one
+ * packet was captured during the interval.
  *
- * @param[in] cfg Capture configuration (must not be NULL; cfg->iface must not
- * be NULL).
+ * @param[in] cfg Capture configuration (must not be NULL; must provide iface or
+ * pcap_file).
  * @return 0 on normal termination; non-zero on error.
  */
 int ns_capture_loop(ns_config *cfg) {
@@ -114,23 +129,25 @@ int ns_capture_loop(ns_config *cfg) {
     fprintf(stderr, "ns_capture_loop: must provide iface or pcap_file\n");
     return 1;
   }
+
+  int is_live = (cfg->pcap_file == NULL);
   const int interval_sec = (cfg->interval_sec <= 0) ? 1 : cfg->interval_sec;
 
   ns_stats st = {0};
   char errbuf[PCAP_ERRBUF_SIZE];
 
- 
   pcap_t *handle = NULL;
 
   if (cfg->pcap_file) {
     handle = pcap_open_offline(cfg->pcap_file, errbuf);
     if (!handle) {
-      fprintf(stderr, "pcap_open_offline failed on %s: %s\n", cfg->pcap_file, errbuf);
+      fprintf(stderr, "pcap_open_offline failed on %s: %s\n", cfg->pcap_file,
+              errbuf);
       return 1;
     }
   } else {
     handle = pcap_open_live(cfg->iface, NS_SNAPLEN, NS_PROMISC,
-                          NS_READ_TIMEOUT_MS, errbuf);
+                            NS_READ_TIMEOUT_MS, errbuf);
     if (!handle) {
       fprintf(stderr, "pcap_open_live failed on %s: %s\n", cfg->iface, errbuf);
       return 1;
@@ -139,12 +156,13 @@ int ns_capture_loop(ns_config *cfg) {
 
   int dlt = pcap_datalink(handle);
   if (dlt != DLT_EN10MB) {
-    fprintf(stderr, "Unsupported datalink: %s (%d). Only Ethernet (DLT_EN10MB) is supported.\n",
-          pcap_datalink_val_to_name(dlt), dlt);
+    fprintf(stderr,
+            "Unsupported datalink: %s (%d). Only Ethernet (DLT_EN10MB) is "
+            "supported.\n",
+            pcap_datalink_val_to_name(dlt), dlt);
     pcap_close(handle);
     return 1;
   }
-
 
   if (cfg->filter && cfg->filter[0] != '\0') {
     struct bpf_program prog = {0};
@@ -157,7 +175,7 @@ int ns_capture_loop(ns_config *cfg) {
       }
     }
 
-    if (pcap_compile(handle, &prog, cfg->filter, 1, PCAP_NETMASK_UNKNOWN) != 0) {
+    if (pcap_compile(handle, &prog, cfg->filter, 1, netmask) != 0) {
       fprintf(stderr, "pcap_compile failed: %s\n", pcap_geterr(handle));
       pcap_close(handle);
       return 1;
@@ -174,31 +192,35 @@ int ns_capture_loop(ns_config *cfg) {
   }
 
   int exit_code = 0;
-  int decoded = 0;
+  int captured = 0;
   time_t last = time(NULL);
 
-  while (cfg->count < 0 || decoded < cfg->count) {
+  while (cfg->count < 0 || captured < cfg->count) {
     struct pcap_pkthdr *hdr = NULL;
     const u_char *data = NULL;
 
     int rc = pcap_next_ex(handle, &hdr, &data);
 
     if (rc == 1) {
+      captured++;
+      st.captured++;
+
       packet_info info;
       if (ns_decode_ethernet(hdr, data, &info) == 0) {
-        decoded++;
-
-        ns_stats_update(&st, &info);
+        ns_stats_update_decoded(&st, &info);
 
         if (!cfg->stats) {
           ns_print_packet(&info);
         }
+      } else {
+        st.decode_failed++;
       }
     } else if (rc == -1) {
       fprintf(stderr, "pcap_next_ex error: %s\n", pcap_geterr(handle));
       exit_code = 1;
       break;
     } else if (rc == -2) {
+      // EOF (offline) or break condition from pcap source
       exit_code = 0;
       break;
     } else if (rc == 0) {
@@ -206,14 +228,18 @@ int ns_capture_loop(ns_config *cfg) {
     }
 
     time_t now = time(NULL);
-    if (cfg->stats && now - last >= interval_sec) {
-      ns_stats_print_reset(&st, interval_sec);
+    if (cfg->stats && (now - last >= interval_sec)) {
+      if (st.captured > 0) {
+        ns_stats_print_reset(&st, interval_sec, is_live);
+      }
       last = now;
     }
   }
-  
-  if (!cfg->pcap_file && cfg->stats && st.total > 0) {
-    ns_stats_print_reset(&st, interval_sec);
+
+  // Final flush for both live and offline, if anything was captured since last
+  // print.
+  if (cfg->stats && st.captured > 0) {
+    ns_stats_print_reset(&st, interval_sec, is_live);
   }
 
   pcap_close(handle);
