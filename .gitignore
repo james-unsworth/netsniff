@@ -11,7 +11,7 @@ CTestTestfile.cmake
 compile_commands.json
 
 # ===== Binaries =====
-netsniff
+netsniff*
 
 # ===== Debug / sanitizer output =====
 *.dSYM/
